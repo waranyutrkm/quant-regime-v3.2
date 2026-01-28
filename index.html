@@ -45,6 +45,21 @@ const STRATEGY_LIST = [
   { id: 'ADAPTIVE_EXPOSURE', name: 'Adaptive Exposure' }
 ];
 
+// --- คอมโพเนนต์ Documentation Section ---
+const DocSection = ({ title, icon: Icon, children, className="" }) => (
+  <section className={`bg-slate-50 rounded-3xl p-6 border border-slate-100 shadow-sm ${className}`}>
+    <div className="flex items-center gap-3 mb-4 border-b border-slate-200 pb-3">
+      <div className="bg-white p-2 rounded-xl shadow-sm text-indigo-600 border border-indigo-50">
+        <Icon size={18} />
+      </div>
+      <h3 className="font-black text-slate-700 uppercase tracking-tight text-xs">{title}</h3>
+    </div>
+    <div className="text-[10px] text-slate-600 space-y-3 leading-relaxed font-medium">
+      {children}
+    </div>
+  </section>
+);
+
 // --- คอมโพเนนต์ Input แบบไม่หน่วง ---
 const SmoothInput = ({ label, value, onUpdate, step = 1, type = "number" }) => {
   const [localValue, setLocalValue] = useState(value);
@@ -583,48 +598,147 @@ const App = () => {
 
                   {/* TAB: THEORY */}
                   {activeTab === 'theory' && (
-                    <div className="space-y-12 animate-in fade-in duration-700">
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
-                        <section className="space-y-6 text-slate-600">
-                           <div className="flex items-center gap-3 border-b pb-4">
-                            <div className="bg-indigo-100 p-3 rounded-2xl text-indigo-600 shadow-inner"><ShieldCheck size={28}/></div>
-                            <h3 className="text-xl font-black text-slate-800 uppercase tracking-tighter">Research Protocols</h3>
-                          </div>
-                          <ul className="space-y-5">
-                             {[
-                               { t: "Survivorship Bias Awareness", d: "ระบบสแกน Universe รายวันเพื่อป้องกันการใช้เหรียญที่หายไปจากตลาดมาคำนวณย้อนหลัง" },
-                               { t: "Dynamic Volatility Targeting", d: "ปรับ Position Size ตามความผันผวนของตลาดเพื่อให้ความเสี่ยงรวมของพอร์ตคงที่" },
-                               { t: "Signal Noise Reduction", d: "ใช้ EMA Smoothing ทับค่า Breadth อีกชั้นเพื่อลดความผันผวนของสัญญาณเข้า-ออก" }
-                             ].map((item, i) => (
-                               <li key={i} className="flex gap-4">
-                                 <div className="bg-emerald-500 h-2 w-2 rounded-full mt-1.5 flex-shrink-0 shadow-lg shadow-emerald-200"></div>
-                                 <div>
-                                   <h4 className="font-black text-sm text-slate-700 uppercase leading-none mb-1">{item.t}</h4>
-                                   <p className="text-xs leading-relaxed">{item.d}</p>
-                                 </div>
-                               </li>
-                             ))}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-in fade-in duration-500 h-[600px] overflow-y-auto custom-scrollbar p-2">
+                      <div className="space-y-6">
+                        <DocSection title="0. Project Concept" icon={Activity}>
+                          <p>Quant Regime v3.2 คือระบบ Research/Backtest ที่ทำงานดังนี้:</p>
+                          <ul className="list-disc pl-4 space-y-1 marker:text-indigo-400">
+                            <li>ดึงข้อมูล OHLC รายวันจาก Binance Futures (Liquid Pairs)</li>
+                            <li>สร้าง <b>Dynamic Universe</b> (คัดเลือกเหรียญสภาพคล่องสูงสุดในแต่ละวัน)</li>
+                            <li>คำนวณ <b>Market Breadth</b> จาก EMA Cross ของแต่ละเหรียญ</li>
+                            <li>แปลง Breadth เป็น Exposure ตามโมเดล Regime ที่เลือก</li>
+                            <li>ใช้ <b>Volatility Targeting</b> เพื่อปรับขนาด Position</li>
+                            <li>Backtest และทำ Grid Search เพื่อหาค่า parameter ที่ดีที่สุด</li>
                           </ul>
-                        </section>
+                        </DocSection>
 
-                        <section className="bg-indigo-900 p-8 rounded-[2.5rem] text-white shadow-2xl relative overflow-hidden flex flex-col justify-center">
-                           <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-indigo-500/20 via-transparent to-transparent"></div>
-                           <h4 className="font-black uppercase tracking-widest text-indigo-300 text-xs mb-6 flex items-center gap-2 relative z-10">
-                             <Calculator size={14}/> Risk Analysis Math
-                           </h4>
-                           <div className="space-y-6 relative z-10">
-                              <div className="p-4 bg-white/5 rounded-2xl border border-white/10">
-                                <span className="block text-[10px] font-black text-indigo-400 uppercase mb-2 text-center">Corrected CAGR Formula</span>
-                                <div className="text-center font-mono text-xs text-indigo-100">
-                                  years = data_count / 365 <br/>
-                                  CAGR = (Ending_NAV / Start_NAV)^(1/years) - 1
-                                </div>
+                        <DocSection title="3. Data Pipeline" icon={Database}>
+                          <p className="font-bold text-slate-800">Step 1: Scan Market</p>
+                          <p>ดึงข้อมูล 24hr Ticker จาก Binance Futures กรองเฉพาะ USDT pairs เรียงตาม QuoteVolume และเลือก Top N (Default: 80)</p>
+                          <div className="bg-slate-900 text-slate-300 p-2 rounded-lg font-mono text-[10px] my-2">
+                            GET /fapi/v1/ticker/24hr
+                          </div>
+
+                          <p className="font-bold text-slate-800 mt-3">Step 2: Download OHLC</p>
+                          <p>ดึงแท่งเทียนรายวัน (Daily Bars) ย้อนหลัง 450 วันสำหรับทุกเหรียญใน Universe</p>
+                          
+                          <p className="font-bold text-slate-800 mt-3">Step 3: Alignment</p>
+                          <p>จัดเรียงข้อมูลทั้งหมดลงใน Time Series เดียวกัน โดยใช้ BTCUSDT เป็น Market Proxy (Benchmark)</p>
+                        </DocSection>
+
+                        <DocSection title="4. Indicators & Formulas" icon={Calculator}>
+                          <div className="space-y-4">
+                            <div>
+                              <span className="font-bold text-indigo-600">EMA Calculation</span>
+                              <div className="bg-white border border-slate-200 p-2 rounded-lg font-mono text-[10px] mt-1">
+                                alpha = 2 / (period + 1)<br/>
+                                EMA[t] = alpha * price[t] + (1 - alpha) * EMA[t-1]
                               </div>
-                              <p className="text-xs text-indigo-200 leading-relaxed italic text-center">
-                                *สูตรนี้ได้รับการแก้ไขให้เป็นไปตามมาตรฐานการวัดผลตอบแทนทบต้นรายปีที่ถูกต้อง
-                              </p>
-                           </div>
-                        </section>
+                            </div>
+                            <div>
+                              <span className="font-bold text-indigo-600">Market Breadth (Volume Weighted)</span>
+                              <p className="mt-1">สัดส่วน Volume ของเหรียญที่เป็นขาขึ้น (EMA Fast &gt; Slow) เทียบกับ Volume ทั้งหมดใน Universe</p>
+                              <div className="bg-white border border-slate-200 p-2 rounded-lg font-mono text-[10px] mt-1">
+                                Breadth[t] = Σ(Vol_bull) / Σ(Vol_total)
+                              </div>
+                            </div>
+                            <div>
+                              <span className="font-bold text-indigo-600">Volatility Targeting</span>
+                              <p className="mt-1">ปรับ Position Size ตามความผันผวนของ BTC (20-day Rolling StdDev)</p>
+                              <div className="bg-white border border-slate-200 p-2 rounded-lg font-mono text-[10px] mt-1">
+                                Vol_Mult = min(1.2, Target_Vol / Current_Vol)
+                              </div>
+                            </div>
+                          </div>
+                        </DocSection>
+
+                        <DocSection title="5. Exposure Models" icon={Layers}>
+                          <div className="grid gap-3">
+                            <div className="p-2 border rounded-xl bg-white">
+                              <div className="font-black text-[10px] text-indigo-600">TREND_FOLLOW</div>
+                              <div>Exposure = 1 เมื่อ Breadth &ge; Threshold, ไม่อย่างนั้น 0</div>
+                            </div>
+                            <div className="p-2 border rounded-xl bg-white">
+                              <div className="font-black text-[10px] text-indigo-600">CONFIRMED_TREND</div>
+                              <div>ต้องการ Breadth &ge; Threshold ต่อเนื่องกัน N วัน (Confirm Days)</div>
+                            </div>
+                            <div className="p-2 border rounded-xl bg-white">
+                              <div className="font-black text-[10px] text-indigo-600">DUAL_REGIME (L/S)</div>
+                              <div>Long (1) เมื่อ &ge; Th, Short (-1) เมื่อ &le; 1-Th, else 0</div>
+                            </div>
+                            <div className="p-2 border rounded-xl bg-white">
+                              <div className="font-black text-[10px] text-indigo-600">ADAPTIVE_EXPOSURE</div>
+                              <div>ปรับ Exposure แบบ Linear ตามความแรงของ Breadth (-1 ถึง 1)</div>
+                            </div>
+                          </div>
+                        </DocSection>
+                      </div>
+
+                      <div className="space-y-6">
+                        <DocSection title="6-11. Backtest Logic" icon={CheckCircle2}>
+                          <ul className="space-y-2 list-disc pl-4 marker:text-emerald-500">
+                            <li>
+                              <b>Final Exposure:</b> Base_Exp * Vol_Multiplier
+                            </li>
+                            <li>
+                              <b>Portfolio Return:</b> Final_Exp * BTC_Return
+                            </li>
+                            <li>
+                              <b>Transaction Fee:</b> คิดค่าธรรมเนียมเมื่อ Exposure เปลี่ยนแปลง &gt; 5% (เพื่อลด Noise การเทรด)
+                            </li>
+                            <li>
+                              <b>CAGR (Corrected):</b> (End_NAV / Start_NAV)^(1/Years) - 1
+                            </li>
+                            <li>
+                              <b>Sortino Ratio:</b> CAGR / Downside_Deviation (Risk-adjusted return ที่ดีกว่า Sharpe สำหรับกลยุทธ์ Trend)
+                            </li>
+                          </ul>
+                        </DocSection>
+
+                        <DocSection title="12. Grid Search & Optimization" icon={Target}>
+                            <p>ระบบทำการทดสอบทุก Combination ที่เป็นไปได้จาก Parameter Ranges ที่กำหนด:</p>
+                            <div className="flex flex-wrap gap-2 mt-2">
+                              {['Universe %', 'EMA Fast', 'EMA Slow', 'Threshold', 'Confirm Days', 'Smooth'].map(t => (
+                                <span key={t} className="px-2 py-1 bg-indigo-50 text-indigo-600 rounded text-[9px] font-bold border border-indigo-100">{t}</span>
+                              ))}
+                            </div>
+                            <p className="mt-3 text-slate-500 italic">
+                              *Optimized Speed: มีการ Cache ค่า EMA ของทุกเหรียญไว้ก่อนเริ่ม Loop เพื่อความรวดเร็วในการคำนวณ
+                            </p>
+                        </DocSection>
+
+                        <DocSection title="14. Research Limitations & Notes" icon={AlertTriangle}>
+                            <div className="space-y-3">
+                              <div className="bg-amber-50 p-3 rounded-xl border border-amber-100 text-amber-800">
+                                <span className="font-bold block mb-1">Why results look unrealistically high?</span>
+                                <ul className="list-disc pl-4 space-y-1">
+                                  <li>Vol Targeting ลด Drawdown มหาศาล และเร่ง CAGR ในช่วงตลาดเป็นใจ</li>
+                                  <li>การใช้ BTC เป็น Proxy แทน Basket จริง อาจทำให้ผลลัพธ์คลาดเคลื่อน (Basis Risk)</li>
+                                  <li>ยังไม่มี Slippage Model และ Funding Rate ในการคำนวณ</li>
+                                </ul>
+                              </div>
+                              <div>
+                                <span className="font-bold block mb-1">Recommended Improvements</span>
+                                <ul className="list-disc pl-4">
+                                  <li>เพิ่ม Slippage และ Funding Rate</li>
+                                  <li>ใช้ Basket of Coins จริงในการคำนวณ PnL แทน BTC Proxy</li>
+                                  <li>ทำ Walk-Forward Analysis เพื่อลด Overfitting (Out-of-sample testing)</li>
+                                </ul>
+                              </div>
+                            </div>
+                        </DocSection>
+
+                        <div className="bg-slate-900 text-slate-400 p-4 rounded-3xl font-mono text-[9px] leading-relaxed">
+                            <div className="flex items-center gap-2 text-indigo-400 font-bold uppercase mb-2 border-b border-slate-700 pb-2">
+                              <Calculator size={12}/> Math Summary
+                            </div>
+                            <p>EMA[t] = α*Price[t] + (1-α)*EMA[t-1]</p>
+                            <p>Breadth[t] = Σ(Bull_Vol) / Σ(Total_Vol)</p>
+                            <p>Vol_Mult[t] = min(1.2, Target / Rolling_Vol_20d)</p>
+                            <p>NAV[t] = NAV[t-1] * (1 + Exp[t]*BTC_Ret[t])</p>
+                            <p>DD[t] = (NAV[t] - Peak[t]) / Peak[t]</p>
+                            <p className="text-emerald-500 mt-2">Sortino = CAGR / (StdDev(Downside_Ret) * √365)</p>
+                        </div>
                       </div>
                     </div>
                   )}
