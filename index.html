@@ -6,7 +6,7 @@ import {
 import { 
   Settings, Play, TrendingUp, AlertTriangle, 
   BarChart3, Activity, ShieldCheck, Info, History, 
-  Layers, Cpu, Target, Database, ListFilter, Clock, Table, Grid3X3, Download, RefreshCw, BookOpen, Calculator, CheckCircle2, Search, ArrowUpDown, Filter, Loader2
+  Layers, Cpu, Target, Database, ListFilter, Clock, Table, Grid3X3, Download, RefreshCw, BookOpen, Calculator, CheckCircle2, Search, ArrowUpDown, Filter, Loader2, DollarSign
 } from 'lucide-react';
 
 // --- ฟังก์ชันคำนวณ EMA (Exponential Moving Average) ---
@@ -105,7 +105,7 @@ const App = () => {
     strategy: 'RUN_ALL',
     breadthMode: 'volume',
     capital: 10000,
-    feePct: 0.0004,
+    feePct: 0.04, // Default Fee 0.04%
     volTarget: 0.02 
   });
 
@@ -282,6 +282,9 @@ const App = () => {
                 ranges.thresholds.forEach(th => {
                   ranges.confirms.forEach(cf => {
                     let nav = gridConfig.capital, peak = nav, mdd = 0;
+                    let periodMaxExp = 0; // Track max exposure for logging period
+                    let globalMaxExp = 0; // Track max exposure ALL TIME
+                    
                     const curve = [];
                     const dailyRets = [];
                     const portLogs = [];
@@ -294,11 +297,22 @@ const App = () => {
                       const baseExp = getExposure(stratId, smoothedBreadth[t], th, cf, t, smoothedBreadth);
                       const finalExp = baseExp * volMultiplier;
                       const dayRet = finalExp * btcReturns[t];
+                      
+                      // เก็บค่า Max Exposure
+                      const absExp = Math.abs(finalExp);
+                      periodMaxExp = Math.max(periodMaxExp, absExp);
+                      globalMaxExp = Math.max(globalMaxExp, absExp);
+
                       nav *= (1 + dayRet);
                       
+                      // --- Transaction Fee Calculation (Proportional to Turnover) ---
                       if (t > 1) {
                         const prevExp = curve[t-2]?.exp || 0;
-                        if (Math.abs(finalExp - prevExp) > 0.05) nav *= (1 - gridConfig.feePct);
+                        const turnover = Math.abs(finalExp - prevExp);
+                        if (turnover > 0.01) { // Apply fee if trade > 1% exposure change to reduce noise
+                           const feeCost = turnover * nav * (gridConfig.feePct / 100);
+                           nav -= feeCost;
+                        }
                       }
 
                       peak = Math.max(peak, nav);
@@ -325,6 +339,7 @@ const App = () => {
                         portLogs.push({
                           date: rawPrices[t].date,
                           exp: finalExp.toFixed(2),
+                          maxExp: periodMaxExp.toFixed(2), // Save period max exposure
                           nav: nav.toFixed(0),
                           activeCount,
                           holdings: bullishCoins.slice(0, 5).map(([name, info]) => ({
@@ -332,6 +347,9 @@ const App = () => {
                             percent: ((info.weight / (totalBullWeight || 1)) * 100).toFixed(1)
                           }))
                         });
+                        
+                        // Reset period tracker
+                        periodMaxExp = 0;
                       }
                     }
 
@@ -348,6 +366,7 @@ const App = () => {
                       profitFactor: Number((dailyRets.filter(r=>r>0).reduce((a,b)=>a+b,0) / Math.abs(dailyRets.filter(r=>r<0).reduce((a,b)=>a+b,0) || 1)).toFixed(2)),
                       curve,
                       portLogs,
+                      maxGlobalExp: Number(globalMaxExp.toFixed(2)), // Save global max exposure
                       paramsStr: `${stratId}-${f}/${s}-${upct}%`
                     });
                   });
@@ -481,6 +500,14 @@ const App = () => {
                     <SmoothInput label="End %" value={gridConfig.universeTopPct.end} onUpdate={(v)=>setGridConfig(c=>({...c, universeTopPct:{...c.universeTopPct, end:v}}))} step={10} />
                     <SmoothInput label="Step" value={gridConfig.universeTopPct.step} onUpdate={(v)=>setGridConfig(c=>({...c, universeTopPct:{...c.universeTopPct, step:v}}))} step={10} />
                   </div>
+                </div>
+                
+                {/* --- Added Trading Fee Input --- */}
+                <div className="p-4 bg-slate-50 rounded-3xl border border-slate-100 shadow-sm">
+                   <label className="text-[10px] font-black text-indigo-500 uppercase tracking-widest flex items-center gap-2 mb-2">
+                      <DollarSign size={12} /> Trading Fee %
+                   </label>
+                   <SmoothInput label="" value={gridConfig.feePct} onUpdate={(v)=>setGridConfig({...gridConfig, feePct: v})} step={0.01} />
                 </div>
 
                 <div className="space-y-4">
@@ -761,7 +788,7 @@ const App = () => {
                            </div>
                         </div>
                         <div className="text-[9px] font-bold text-slate-400 uppercase tracking-[0.2em] border-l pl-4 border-slate-200">
-                          EMA: {bestResult.f}/{bestResult.s} | Th: {bestResult.th} | Confirm: {bestResult.cf}d | Smooth: {bestResult.sm} | Univ: {bestResult.upct}%
+                          EMA: {bestResult.f}/{bestResult.s} | Th: {bestResult.th} | Confirm: {bestResult.cf}d | Smooth: {bestResult.sm} | Univ: {bestResult.upct}% | Max Exp: {bestResult.maxGlobalExp}x | Fee: {gridConfig.feePct}%
                         </div>
                       </div>
                       <ResponsiveContainer width="100%" height="100%">
@@ -786,45 +813,59 @@ const App = () => {
 
                   {/* TAB: HOLDINGS LOGS */}
                   {activeTab === 'logs' && bestResult && (
-                    <div className="overflow-x-auto rounded-[2rem] border border-slate-100 shadow-sm animate-in fade-in">
-                      <table className="w-full text-[10px] text-left">
-                        <thead className="bg-slate-900 text-slate-400 font-black uppercase tracking-widest border-b">
-                          <tr>
-                            <th className="p-5">Date</th>
-                            <th className="p-5 text-center">Exposure</th>
-                            <th className="p-5 text-center">Universe</th>
-                            <th className="p-5">Top Bullish Assets (By Volume)</th>
-                            <th className="p-5 text-right">Portfolio NAV ($)</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-50">
-                          {bestResult.portLogs && bestResult.portLogs.length > 0 ? (
-                            bestResult.portLogs.slice().reverse().map((log, i) => (
-                              <tr key={i} className="hover:bg-slate-50 transition-colors">
-                                <td className="p-5 font-mono text-slate-500 font-bold">{log.date}</td>
-                                <td className="p-5 text-center">
-                                  <span className={`px-3 py-1 rounded-full text-[8px] font-black uppercase shadow-sm ${parseFloat(log.exp) > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
-                                    {log.exp}x
-                                  </span>
-                                </td>
-                                <td className="p-5 text-center font-black text-slate-400">{log.activeCount}</td>
-                                <td className="p-5">
-                                  <div className="flex flex-wrap gap-1.5">
-                                    {log.holdings.map((h, idx) => (
-                                      <span key={idx} className="bg-white border border-slate-100 px-2 py-0.5 rounded-lg text-indigo-600 font-black text-[8px] shadow-sm">
-                                        {h.name}: {h.percent}%
-                                      </span>
-                                    ))}
-                                  </div>
-                                </td>
-                                <td className="p-5 text-right font-black text-slate-800 font-mono text-xs">${parseFloat(log.nav).toLocaleString()}</td>
-                              </tr>
-                            ))
-                          ) : (
-                            <tr><td colSpan="5" className="p-10 text-center text-slate-400 italic font-bold uppercase">Run Grid Search to view logs</td></tr>
-                          )}
-                        </tbody>
-                      </table>
+                    <div className="space-y-4 animate-in fade-in">
+                      <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-4 flex items-center justify-between">
+                         <h3 className="text-xs font-black text-indigo-800 uppercase tracking-widest flex items-center gap-2">
+                           <History size={14}/> Holdings History
+                         </h3>
+                         <div className="text-[10px] font-bold text-indigo-600 uppercase bg-white px-3 py-1 rounded-lg border border-indigo-100 shadow-sm">
+                            Peak Exposure (All Time): {bestResult.maxGlobalExp}x
+                         </div>
+                      </div>
+                      <div className="overflow-x-auto rounded-[2rem] border border-slate-100 shadow-sm">
+                        <table className="w-full text-[10px] text-left">
+                          <thead className="bg-slate-900 text-slate-400 font-black uppercase tracking-widest border-b">
+                            <tr>
+                              <th className="p-5">Date</th>
+                              <th className="p-5 text-center">Exposure</th>
+                              <th className="p-5 text-center text-indigo-500">Max Exp (30d)</th>
+                              <th className="p-5 text-center">Universe</th>
+                              <th className="p-5">Top Bullish Assets (By Volume)</th>
+                              <th className="p-5 text-right">Portfolio NAV ($)</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-50">
+                            {bestResult.portLogs && bestResult.portLogs.length > 0 ? (
+                              bestResult.portLogs.slice().reverse().map((log, i) => (
+                                <tr key={i} className="hover:bg-slate-50 transition-colors">
+                                  <td className="p-5 font-mono text-slate-500 font-bold">{log.date}</td>
+                                  <td className="p-5 text-center">
+                                    <span className={`px-3 py-1 rounded-full text-[8px] font-black uppercase shadow-sm ${parseFloat(log.exp) > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
+                                      {log.exp}x
+                                    </span>
+                                  </td>
+                                  <td className="p-5 text-center font-mono font-bold text-indigo-600 bg-indigo-50/50">
+                                    {log.maxExp}x
+                                  </td>
+                                  <td className="p-5 text-center font-black text-slate-400">{log.activeCount}</td>
+                                  <td className="p-5">
+                                    <div className="flex flex-wrap gap-1.5">
+                                      {log.holdings.map((h, idx) => (
+                                        <span key={idx} className="bg-white border border-slate-100 px-2 py-0.5 rounded-lg text-indigo-600 font-black text-[8px] shadow-sm">
+                                          {h.name}: {h.percent}%
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </td>
+                                  <td className="p-5 text-right font-black text-slate-800 font-mono text-xs">${parseFloat(log.nav).toLocaleString()}</td>
+                                </tr>
+                              ))
+                            ) : (
+                              <tr><td colSpan="6" className="p-10 text-center text-slate-400 italic font-bold uppercase">Run Grid Search to view logs</td></tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
                     </div>
                   )}
                 </>
