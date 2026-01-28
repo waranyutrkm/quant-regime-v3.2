@@ -1,0 +1,745 @@
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import { 
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area,
+  ReferenceLine, ComposedChart, Bar, Cell
+} from 'recharts';
+import { 
+  Settings, Play, TrendingUp, AlertTriangle, 
+  BarChart3, Activity, ShieldCheck, Info, History, 
+  Layers, Cpu, Target, Database, ListFilter, Clock, Table, Grid3X3, Download, RefreshCw, BookOpen, Calculator, CheckCircle2, Search, ArrowUpDown, Filter, Loader2
+} from 'lucide-react';
+
+// --- ฟังก์ชันคำนวณ EMA (Exponential Moving Average) ---
+const ema = (arr, p) => {
+  if (!arr || arr.length === 0) return [];
+  const a = 2 / (p + 1);
+  let o = [arr[0]];
+  for (let i = 1; i < arr.length; i++) o.push(a * arr[i] + (1 - a) * o[i - 1]);
+  return o;
+};
+
+// --- ฟังก์ชันคำนวณ Standard Deviation (สำหรับ Vol Scaling) ---
+const getStdDev = (arr) => {
+  const n = arr.length;
+  if (n < 2) return 0;
+  const mean = arr.reduce((a, b) => a + b, 0) / n;
+  return Math.sqrt(arr.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b, 0) / (n - 1));
+};
+
+// --- ฟังก์ชันสร้างช่วงตัวแปรสำหรับ Grid Search ---
+const genRange = (s, e, st) => {
+  let r = [];
+  const start = parseFloat(s);
+  const end = parseFloat(e);
+  const step = parseFloat(st);
+  if (step <= 0 || start > end) return [start];
+  for (let i = start; i <= end; i += step) r.push(Number(i.toFixed(4)));
+  if (r.length > 0 && r[r.length - 1] < end && Math.abs(r[r.length - 1] - end) > 0.0001) r.push(end);
+  return r;
+};
+
+const STRATEGY_LIST = [
+  { id: 'TREND_FOLLOW', name: 'Trend Follow' },
+  { id: 'CONFIRMED_TREND', name: 'Confirmed Trend' },
+  { id: 'DUAL_REGIME', name: 'Dual Regime (L/S)' },
+  { id: 'ADAPTIVE_EXPOSURE', name: 'Adaptive Exposure' }
+];
+
+// --- คอมโพเนนต์ Input แบบไม่หน่วง ---
+const SmoothInput = ({ label, value, onUpdate, step = 1, type = "number" }) => {
+  const [localValue, setLocalValue] = useState(value);
+  useEffect(() => { setLocalValue(value); }, [value]);
+
+  const handleBlur = () => {
+    const num = type === "number" ? parseFloat(localValue) : localValue;
+    onUpdate(num);
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter') {
+      const num = type === "number" ? parseFloat(localValue) : localValue;
+      onUpdate(num);
+      e.target.blur();
+    }
+  };
+
+  return (
+    <div className="flex flex-col">
+      <span className="text-[8px] text-slate-400 font-bold mb-0.5 uppercase tracking-tighter text-center">{label}</span>
+      <input 
+        type={type} step={step}
+        value={localValue}
+        onChange={(e) => setLocalValue(e.target.value)}
+        onBlur={handleBlur}
+        onKeyDown={handleKeyDown}
+        className="border-none bg-white rounded-lg p-1 text-xs font-bold outline-indigo-500 shadow-sm w-full text-center"
+      />
+    </div>
+  );
+};
+
+const App = () => {
+  // 1. Grid Configuration - ตั้งค่าเริ่มต้นตามโจทย์
+  const [gridConfig, setGridConfig] = useState({
+    universeTopPct: { start: 50, end: 100, step: 25 }, 
+    emaFast: { start: 10, end: 10, step: 5 },
+    emaSlow: { start: 50, end: 100, step: 50 },
+    threshold: { start: 0.5, end: 0.7, step: 0.1 },
+    confirmDays: { start: 1, end: 3, step: 2 },
+    breadthSmooth: { start: 3, end: 3, step: 2 }, 
+    strategy: 'RUN_ALL',
+    breadthMode: 'volume',
+    capital: 10000,
+    feePct: 0.0004,
+    volTarget: 0.02 
+  });
+
+  const [rawPrices, setRawPrices] = useState([]);
+  const [allGridResults, setAllGridResults] = useState([]);
+  const [bestResult, setBestResult] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [gridProgress, setGridProgress] = useState(0); // ติดตามความคืบหน้า Grid
+  const [loadingProgress, setLoadingProgress] = useState({ current: 0, total: 0, status: 'idle', message: '' });
+  const [activeTab, setActiveTab] = useState('grid');
+  const [robustnessMatrix, setRobustnessMatrix] = useState([]);
+  
+  const [searchTerm, setSearchTerm] = useState('');
+  const [sortConfig, setSortConfig] = useState({ key: 'cagr', direction: 'desc' });
+
+  // --- Fetch Data Engine (Optimized for Binance API) ---
+  const fetchDynamicUniverseData = async () => {
+    setLoadingProgress({ current: 0, total: 0, status: 'fetching', message: 'กำลังสแกนตลาด Binance Futures...' });
+    try {
+      const tickerResp = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
+      const tickerData = await tickerResp.json();
+      
+      const topSymbols = tickerData
+        .filter(t => t.symbol.endsWith('USDT'))
+        .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+        .slice(0, 80) 
+        .map(t => t.symbol);
+
+      setLoadingProgress({ current: 0, total: topSymbols.length, status: 'fetching', message: 'กำลังเชื่อมต่อและดึงข้อมูลราคา...' });
+
+      const allData = {};
+      const datesSet = new Set();
+      const batchSize = 10;
+
+      for (let i = 0; i < topSymbols.length; i += batchSize) {
+        const batch = topSymbols.slice(i, i + batchSize);
+        await Promise.all(batch.map(async (symbol) => {
+          try {
+            const resp = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1d&limit=450`);
+            const klines = await resp.json();
+            if (Array.isArray(klines)) {
+              allData[symbol] = klines.map(k => ({
+                date: new Date(k[0]).toISOString().split('T')[0],
+                close: parseFloat(k[4]),
+                quoteVolume: parseFloat(k[7]) 
+              }));
+              allData[symbol].forEach(d => datesSet.add(d.date));
+            }
+          } catch (e) { console.warn(`Error fetching ${symbol}`); }
+        }));
+        setLoadingProgress(prev => ({ 
+          ...prev, 
+          current: Math.min(i + batchSize, topSymbols.length),
+          message: `กำลังดาวน์โหลด: ${Math.min(i + batchSize, topSymbols.length)} / ${topSymbols.length} เหรียญ`
+        }));
+      }
+
+      const sortedDates = Array.from(datesSet).sort();
+      const formattedData = sortedDates.map(date => {
+        const entry = { date, symbols: {}, market_proxy: 0 };
+        Object.keys(allData).forEach(s => {
+          const found = allData[s].find(d => d.date === date);
+          if (found) {
+            entry.symbols[s] = { close: found.close, quoteVolume: found.quoteVolume };
+            if (s === 'BTCUSDT') entry.market_proxy = found.close;
+          }
+        });
+        return entry;
+      }).filter(d => d.market_proxy > 0);
+
+      setRawPrices(formattedData);
+      setLoadingProgress({ current: topSymbols.length, total: topSymbols.length, status: 'success', message: 'เตรียมข้อมูลเสร็จสมบูรณ์' });
+    } catch (error) {
+      setLoadingProgress(prev => ({ ...prev, status: 'error', message: 'เครือข่ายขัดข้อง กรุณารีเฟรชหน้าจอ' }));
+    }
+  };
+
+  useEffect(() => { fetchDynamicUniverseData(); }, []);
+
+  const getExposure = (strategy, b, th, cf, t, bHistory) => {
+    if (strategy === "TREND_FOLLOW") return b >= th ? 1 : 0;
+    if (strategy === "CONFIRMED_TREND") {
+      const win = bHistory.slice(Math.max(0, t - cf + 1), t + 1);
+      return win.length >= cf && win.every(v => v >= th) ? 1 : 0;
+    }
+    if (strategy === "MEAN_REVERSION") return b <= 1 - th ? 1 : 0;
+    if (strategy === "DUAL_REGIME") {
+      if (b >= th) return 1;
+      if (b <= 1 - th) return -1;
+      return 0;
+    }
+    if (strategy === "ADAPTIVE_EXPOSURE") return Math.max(-1, Math.min(1, (b - 0.5) / 0.5));
+    return 0;
+  };
+
+  const calculatePerformanceOverTime = (curve, days) => {
+    if (!curve || curve.length < days) return null;
+    const subset = curve.slice(-days);
+    const startNav = subset[0].nav;
+    const endNav = subset[subset.length - 1].nav;
+    const ret = ((endNav / startNav) - 1) * 100;
+    const p = Math.max(...subset.map(x => x.nav));
+    const mdd = Math.min(...subset.map(x => (x.nav - p) / (p || 1))) * 100;
+    return { ret: ret.toFixed(2), mdd: mdd.toFixed(2) };
+  };
+
+  const runAllTests = () => {
+    if (rawPrices.length === 0) return;
+    setIsProcessing(true);
+    setGridProgress(0);
+    
+    setTimeout(() => {
+      const results = [];
+      const marketPrices = rawPrices.map(d => d.market_proxy);
+      const btcReturns = marketPrices.map((p, i) => i === 0 ? 0 : (p / marketPrices[i-1]) - 1);
+      
+      const ranges = {
+        upcts: genRange(gridConfig.universeTopPct.start, gridConfig.universeTopPct.end, gridConfig.universeTopPct.step),
+        fasts: genRange(gridConfig.emaFast.start, gridConfig.emaFast.end, gridConfig.emaFast.step),
+        slows: genRange(gridConfig.emaSlow.start, gridConfig.emaSlow.end, gridConfig.emaSlow.step),
+        thresholds: genRange(gridConfig.threshold.start, gridConfig.threshold.end, gridConfig.threshold.step),
+        confirms: genRange(gridConfig.confirmDays.start, gridConfig.confirmDays.end, gridConfig.confirmDays.step),
+        smooths: genRange(gridConfig.breadthSmooth.start, gridConfig.breadthSmooth.end, gridConfig.breadthSmooth.step),
+        strategies: gridConfig.strategy === 'RUN_ALL' ? STRATEGY_LIST.map(s => s.id) : [gridConfig.strategy]
+      };
+
+      const emaCache = {}; 
+      const uniqueSymbols = Array.from(new Set(rawPrices.flatMap(d => Object.keys(d.symbols))));
+      const neededFasts = new Set(ranges.fasts);
+      const neededSlows = new Set(ranges.slows);
+
+      uniqueSymbols.forEach(sym => {
+        emaCache[sym] = {};
+        const symPrices = rawPrices.map(d => d.symbols[sym]?.close || null);
+        const filled = []; let last = 0; symPrices.forEach(p => { if (p) last = p; filled.push(last); });
+        
+        [...neededFasts, ...neededSlows].forEach(p => {
+          emaCache[sym][p] = ema(filled, p);
+        });
+      });
+
+      const totalSteps = ranges.fasts.length * ranges.slows.length * ranges.upcts.length;
+      let currentStep = 0;
+
+      ranges.fasts.forEach(f => {
+        ranges.slows.filter(s => s > f).forEach(s => {
+          ranges.upcts.forEach(upct => {
+            currentStep++;
+            const rawBreadthSeries = [];
+            const dailyWeightSnapshots = [];
+
+            for (let t = 0; t < rawPrices.length; t++) {
+              let bullW = 0, totalW = 0, bullC = 0;
+              const activeAtT = Object.entries(rawPrices[t].symbols).sort((a, b) => b[1].quoteVolume - a[1].quoteVolume);
+              const countToTake = Math.max(1, Math.floor(activeAtT.length * (upct / 100)));
+              const filteredSymbols = activeAtT.slice(0, countToTake);
+              const dailyWeights = {};
+
+              filteredSymbols.forEach(([sym, info]) => {
+                const isBull = emaCache[sym][f][t] > emaCache[sym][s][t];
+                const w = gridConfig.breadthMode === 'volume' ? info.quoteVolume : 1;
+                if (isBull) { bullW += w; bullC++; }
+                totalW += w;
+                dailyWeights[sym] = { isBull, weight: w };
+              });
+              rawBreadthSeries.push(gridConfig.breadthMode === 'volume' ? (bullW / (totalW || 1)) : (bullC / filteredSymbols.length));
+              dailyWeightSnapshots.push({ weights: dailyWeights, activeCount: filteredSymbols.length });
+            }
+
+            ranges.smooths.forEach(sm => {
+              const smoothedBreadth = ema(rawBreadthSeries, sm);
+              
+              ranges.strategies.forEach(stratId => {
+                ranges.thresholds.forEach(th => {
+                  ranges.confirms.forEach(cf => {
+                    let nav = gridConfig.capital, peak = nav, mdd = 0;
+                    const curve = [];
+                    const dailyRets = [];
+                    const portLogs = [];
+
+                    for (let t = 1; t < rawPrices.length; t++) {
+                      const lookback = btcReturns.slice(Math.max(0, t - 20), t);
+                      const currentVol = lookback.length > 1 ? getStdDev(lookback) : 0.02;
+                      const volMultiplier = currentVol > 0 ? Math.min(1.2, gridConfig.volTarget / currentVol) : 1;
+
+                      const baseExp = getExposure(stratId, smoothedBreadth[t], th, cf, t, smoothedBreadth);
+                      const finalExp = baseExp * volMultiplier;
+                      const dayRet = finalExp * btcReturns[t];
+                      nav *= (1 + dayRet);
+                      
+                      if (t > 1) {
+                        const prevExp = curve[t-2]?.exp || 0;
+                        if (Math.abs(finalExp - prevExp) > 0.05) nav *= (1 - gridConfig.feePct);
+                      }
+
+                      peak = Math.max(peak, nav);
+                      mdd = Math.min(mdd, (nav - peak) / peak);
+                      dailyRets.push(dayRet);
+                      
+                      const snapshot = { 
+                        date: rawPrices[t].date, 
+                        nav, 
+                        pnl: (nav/gridConfig.capital-1)*100, 
+                        btc: (marketPrices[t]/marketPrices[0]-1)*100, 
+                        exp: finalExp, 
+                        dd: (nav-peak)/peak*100 
+                      };
+                      curve.push(snapshot);
+
+                      if (t % 30 === 0 && finalExp !== 0) {
+                        const { weights, activeCount } = dailyWeightSnapshots[t];
+                        const bullishCoins = Object.entries(weights)
+                          .filter(([_, info]) => info.isBull)
+                          .sort((a, b) => b[1].weight - a[1].weight);
+                        const totalBullWeight = bullishCoins.reduce((sum, curr) => sum + curr[1].weight, 0);
+
+                        portLogs.push({
+                          date: rawPrices[t].date,
+                          exp: finalExp.toFixed(2),
+                          nav: nav.toFixed(0),
+                          activeCount,
+                          holdings: bullishCoins.slice(0, 5).map(([name, info]) => ({
+                            name,
+                            percent: ((info.weight / (totalBullWeight || 1)) * 100).toFixed(1)
+                          }))
+                        });
+                      }
+                    }
+
+                    const years = rawPrices.length / 365;
+                    const cagr = (Math.pow(nav / gridConfig.capital, 1 / (years || 1)) - 1) * 100;
+                    const downRets = dailyRets.filter(r => r < 0);
+                    const sortino = downRets.length > 0 ? (cagr / 100) / (getStdDev(downRets) * Math.sqrt(365)) : 0;
+
+                    results.push({
+                      f, s, th, cf, upct, sm, strategy: stratId,
+                      cagr: Number(cagr.toFixed(2)),
+                      mdd: Number((mdd * 100).toFixed(2)),
+                      sortino: Number(sortino.toFixed(2)),
+                      profitFactor: Number((dailyRets.filter(r=>r>0).reduce((a,b)=>a+b,0) / Math.abs(dailyRets.filter(r=>r<0).reduce((a,b)=>a+b,0) || 1)).toFixed(2)),
+                      curve,
+                      portLogs,
+                      paramsStr: `${stratId}-${f}/${s}-${upct}%`
+                    });
+                  });
+                });
+              });
+            });
+            setGridProgress(Math.floor((currentStep / totalSteps) * 100));
+          });
+        });
+      });
+
+      results.sort((a, b) => b.cagr - a.cagr);
+      
+      results.forEach(res => {
+        const neighbors = results.filter(r => 
+          r.f === res.f && r.strategy === res.strategy &&
+          Math.abs(r.s - res.s) <= (gridConfig.emaSlow.step || 1) && 
+          Math.abs(r.th - res.th) <= (gridConfig.threshold.step || 0.1)
+        );
+        const avgCagr = neighbors.reduce((sum, n) => sum + n.cagr, 0) / (neighbors.length || 1);
+        res.robustness = (avgCagr / (Math.abs(res.cagr) || 1)) * 100;
+      });
+
+      setAllGridResults(results);
+      const champ = results[0];
+      setBestResult(champ);
+      
+      const matrixData = [];
+      const thList = genRange(gridConfig.threshold.start, gridConfig.threshold.end, gridConfig.threshold.step).slice(0, 5);
+      const sList = genRange(gridConfig.emaSlow.start, gridConfig.emaSlow.end, gridConfig.emaSlow.step).slice(0, 5);
+      sList.forEach(sVal => {
+        const row = { emaSlow: sVal };
+        thList.forEach(thVal => {
+          const match = results.find(r => r.f === champ.f && r.s === sVal && r.th === thVal && r.cf === champ.cf && r.upct === champ.upct && r.strategy === champ.strategy);
+          row[`th_${thVal.toFixed(2)}`] = match ? match.cagr : null;
+        });
+        matrixData.push(row);
+      });
+      setRobustnessMatrix(matrixData);
+      
+      setIsProcessing(false);
+      setActiveTab('grid');
+    }, 100);
+  };
+
+  const handleSort = (key) => {
+    let direction = 'desc';
+    if (sortConfig.key === key && sortConfig.direction === 'desc') direction = 'asc';
+    setSortConfig({ key, direction });
+  };
+
+  const filteredResults = useMemo(() => {
+    let res = [...allGridResults];
+    if (searchTerm) {
+      res = res.filter(r => r.paramsStr.toLowerCase().includes(searchTerm.toLowerCase()) || r.strategy.includes(searchTerm.toUpperCase()));
+    }
+    res.sort((a, b) => {
+      if (a[sortConfig.key] < b[sortConfig.key]) return sortConfig.direction === 'asc' ? -1 : 1;
+      if (a[sortConfig.key] > b[sortConfig.key]) return sortConfig.direction === 'asc' ? 1 : -1;
+      return 0;
+    });
+    return res;
+  }, [allGridResults, searchTerm, sortConfig]);
+
+  return (
+    <div className="min-h-screen bg-[#f8fafc] text-slate-900 font-sans pb-20">
+      <div className="max-w-[1580px] mx-auto p-4 md:p-8">
+        
+        {/* Header */}
+        <header className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-6 bg-white p-8 rounded-[2.5rem] shadow-xl border border-white relative overflow-hidden">
+          <div className="absolute top-0 right-0 w-64 h-64 bg-indigo-50 rounded-full -mr-32 -mt-32 opacity-50 blur-3xl"></div>
+          <div className="flex items-center gap-6 relative z-10">
+            <div className="bg-indigo-600 p-5 rounded-3xl shadow-lg shadow-indigo-200">
+              <Activity className="text-white" size={32} />
+            </div>
+            <div>
+              <h1 className="text-3xl font-black text-slate-800 tracking-tighter uppercase">
+                Quant <span className="text-indigo-600 italic">Regime v3.2</span>
+              </h1>
+              <p className="text-slate-400 text-xs font-bold tracking-[0.2em] uppercase">Optimized Market Breadth Search Engine</p>
+            </div>
+          </div>
+          
+          <div className="flex items-center gap-4 w-full md:w-auto relative z-10">
+            <div className="flex-1 md:flex-none">
+              <label className="text-[10px] font-black text-slate-400 block mb-1 uppercase ml-1">Optimization Target</label>
+              <select 
+                value={gridConfig.strategy}
+                onChange={(e) => setGridConfig({...gridConfig, strategy: e.target.value})}
+                className="w-full bg-slate-900 text-white border-none rounded-2xl px-5 py-3.5 font-black text-sm outline-none ring-4 ring-slate-100 focus:ring-indigo-500 transition-all cursor-pointer shadow-xl"
+              >
+                <option value="RUN_ALL">🔥 SEARCH ALL MODELS</option>
+                {STRATEGY_LIST.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <button 
+              onClick={runAllTests} disabled={isProcessing || loadingProgress.status === 'fetching'}
+              className="mt-5 bg-indigo-600 hover:bg-indigo-700 text-white px-10 py-4 rounded-2xl font-black flex items-center justify-center gap-3 transition-all active:scale-95 disabled:opacity-50 shadow-2xl h-[56px] min-w-[180px]"
+            >
+              {isProcessing ? (
+                <div className="flex items-center gap-2">
+                  <Loader2 className="animate-spin" size={20} />
+                  <span>{gridProgress}%</span>
+                </div>
+              ) : <Play size={20} fill="currentColor" />}
+              {isProcessing ? 'CALCULATING...' : 'RUN QUANT GRID'}
+            </button>
+          </div>
+        </header>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          
+          <aside className="lg:col-span-3 space-y-6">
+            <div className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm sticky top-8 max-h-[85vh] overflow-y-auto custom-scrollbar">
+              <div className="flex items-center justify-between mb-8 pb-4 border-b">
+                <h2 className="font-black text-slate-800 uppercase text-xs tracking-widest flex items-center gap-2">
+                   <Target size={16} className="text-indigo-600"/> Optimizer Ranges
+                </h2>
+                <button onClick={fetchDynamicUniverseData} className="p-2 hover:bg-slate-50 rounded-lg text-slate-400 transition-colors">
+                  <RefreshCw size={16} />
+                </button>
+              </div>
+
+              <div className="space-y-6">
+                <div className="bg-indigo-50/50 p-4 rounded-3xl border border-indigo-100">
+                  <div className="flex items-center gap-2 text-indigo-700 font-black text-[10px] uppercase mb-3">
+                    <Database size={12}/> Universe Selection
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <SmoothInput label="Start %" value={gridConfig.universeTopPct.start} onUpdate={(v)=>setGridConfig(c=>({...c, universeTopPct:{...c.universeTopPct, start:v}}))} step={10} />
+                    <SmoothInput label="End %" value={gridConfig.universeTopPct.end} onUpdate={(v)=>setGridConfig(c=>({...c, universeTopPct:{...c.universeTopPct, end:v}}))} step={10} />
+                    <SmoothInput label="Step" value={gridConfig.universeTopPct.step} onUpdate={(v)=>setGridConfig(c=>({...c, universeTopPct:{...c.universeTopPct, step:v}}))} step={10} />
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                   <GridParamInput label="EMA Fast (Short)" configKey="emaFast" step={5} gridConfig={gridConfig} setGridConfig={setGridConfig} />
+                   <GridParamInput label="EMA Slow (Long)" configKey="emaSlow" step={10} gridConfig={gridConfig} setGridConfig={setGridConfig} />
+                   <GridParamInput label="Threshold (Regime)" configKey="threshold" step={0.05} gridConfig={gridConfig} setGridConfig={setGridConfig} />
+                   <GridParamInput label="Signal Smooth (EMA)" configKey="breadthSmooth" step={1} gridConfig={gridConfig} setGridConfig={setGridConfig} />
+                   <GridParamInput label="Confirm Days" configKey="confirmDays" step={1} gridConfig={gridConfig} setGridConfig={setGridConfig} />
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          <main className="lg:col-span-9 space-y-8">
+            
+            <div className="flex bg-white p-1.5 rounded-2xl shadow-sm border border-slate-200">
+              {[
+                { id: 'grid', label: 'Grid Dashboard', icon: Table },
+                { id: 'theory', label: 'Quant Logic', icon: BookOpen },
+                { id: 'pnl_chart', label: 'Alpha Analyzer', icon: BarChart3 },
+                { id: 'logs', label: 'Holdings History', icon: Database }
+              ].map(tab => (
+                <button 
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`flex-1 py-3.5 px-4 rounded-xl flex items-center justify-center gap-2 text-[11px] font-black transition-all ${activeTab === tab.id ? 'bg-indigo-600 text-white shadow-xl shadow-indigo-200 scale-[1.02]' : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+                >
+                  <tab.icon size={14} /> {tab.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="bg-white rounded-[3rem] border border-slate-200 shadow-2xl p-10 min-h-[650px] relative">
+              {loadingProgress.status === 'fetching' ? (
+                <div className="flex flex-col items-center justify-center h-[450px]">
+                  <div className="relative w-20 h-20 mb-8 text-indigo-600">
+                    <Loader2 className="w-full h-full animate-spin" />
+                  </div>
+                  <p className="font-black text-slate-800 uppercase tracking-[0.3em] text-sm animate-pulse text-center">{loadingProgress.message}</p>
+                  <p className="text-xs text-slate-400 mt-2">โปรดรอสักครู่ ระบบกำลังสื่อสารกับ Binance API...</p>
+                </div>
+              ) : (
+                <>
+                  {/* TAB: GRID TABLE */}
+                  {activeTab === 'grid' && allGridResults.length > 0 && (
+                    <div className="space-y-8 animate-in fade-in duration-500">
+                      <div className="flex flex-col md:flex-row justify-between items-end gap-6 border-b pb-8">
+                        <div>
+                          <h3 className="text-xl font-black text-slate-800 uppercase tracking-tight mb-1">Optimization Results</h3>
+                          <p className="text-xs text-slate-400 font-bold uppercase tracking-wider">{allGridResults.length} Combinations Analyzed</p>
+                        </div>
+                        <div className="flex items-center gap-3 w-full md:w-80">
+                          <div className="relative w-full">
+                            <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+                            <input 
+                              placeholder="SEARCH MODEL OR EMA..." 
+                              className="w-full bg-slate-50 border-none rounded-2xl pl-12 pr-4 py-3 text-xs font-bold focus:ring-2 focus:ring-indigo-500 outline-none"
+                              value={searchTerm}
+                              onChange={(e) => setSearchTerm(e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="overflow-x-auto rounded-3xl border border-slate-100 shadow-sm">
+                        <table className="w-full text-[10px] text-left">
+                          <thead className="bg-slate-900 text-slate-400 uppercase font-black tracking-widest">
+                            <tr>
+                              <th className="p-5 cursor-pointer hover:text-white" onClick={() => handleSort('strategy')}>
+                                <div className="flex items-center gap-2">MODEL <ArrowUpDown size={10}/></div>
+                              </th>
+                              <th className="p-5 text-center">EMA (F/S)</th>
+                              <th className="p-5 text-center cursor-pointer hover:text-white" onClick={() => handleSort('upct')}>
+                                <div className="flex items-center justify-center gap-2">UNIV% <ArrowUpDown size={10}/></div>
+                              </th>
+                              <th className="p-5 text-center cursor-pointer hover:text-white text-indigo-300" onClick={() => handleSort('cagr')}>
+                                <div className="flex items-center justify-center gap-2">CAGR% <ArrowUpDown size={10}/></div>
+                              </th>
+                              <th className="p-5 text-center cursor-pointer hover:text-white text-emerald-300" onClick={() => handleSort('sortino')}>
+                                <div className="flex items-center justify-center gap-2">SORTINO <ArrowUpDown size={10}/></div>
+                              </th>
+                              <th className="p-5 text-center cursor-pointer hover:text-white text-rose-300" onClick={() => handleSort('mdd')}>
+                                <div className="flex items-center justify-center gap-2">MAX DD% <ArrowUpDown size={10}/></div>
+                              </th>
+                              <th className="p-5 text-right">VIEW</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {filteredResults.slice(0, 50).map((res, i) => (
+                              <tr key={i} className={`hover:bg-indigo-50/40 transition-all group ${i === 0 && !searchTerm ? 'bg-indigo-50/50' : ''}`}>
+                                <td className="p-5 font-black text-slate-600 uppercase">{res.strategy}</td>
+                                <td className="p-5 font-mono text-center text-slate-400">({res.f}/{res.s})</td>
+                                <td className="p-5 text-center font-bold">{res.upct}%</td>
+                                <td className="p-5 text-center font-black text-indigo-600 text-sm">
+                                  {res.cagr}%
+                                </td>
+                                <td className="p-5 text-center font-black">
+                                  <span className={`px-2 py-1 rounded-lg ${res.sortino > 2 ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                                    {res.sortino}
+                                  </span>
+                                </td>
+                                <td className="p-5 text-center font-black text-rose-500">{res.mdd}%</td>
+                                <td className="p-5 text-right">
+                                  <button onClick={() => {setBestResult(res); setActiveTab('pnl_chart');}} className="p-2.5 bg-white border border-slate-200 group-hover:bg-indigo-600 group-hover:text-white rounded-xl shadow-sm transition-all">
+                                    <TrendingUp size={14}/>
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* TAB: THEORY */}
+                  {activeTab === 'theory' && (
+                    <div className="space-y-12 animate-in fade-in duration-700">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
+                        <section className="space-y-6 text-slate-600">
+                           <div className="flex items-center gap-3 border-b pb-4">
+                            <div className="bg-indigo-100 p-3 rounded-2xl text-indigo-600 shadow-inner"><ShieldCheck size={28}/></div>
+                            <h3 className="text-xl font-black text-slate-800 uppercase tracking-tighter">Research Protocols</h3>
+                          </div>
+                          <ul className="space-y-5">
+                             {[
+                               { t: "Survivorship Bias Awareness", d: "ระบบสแกน Universe รายวันเพื่อป้องกันการใช้เหรียญที่หายไปจากตลาดมาคำนวณย้อนหลัง" },
+                               { t: "Dynamic Volatility Targeting", d: "ปรับ Position Size ตามความผันผวนของตลาดเพื่อให้ความเสี่ยงรวมของพอร์ตคงที่" },
+                               { t: "Signal Noise Reduction", d: "ใช้ EMA Smoothing ทับค่า Breadth อีกชั้นเพื่อลดความผันผวนของสัญญาณเข้า-ออก" }
+                             ].map((item, i) => (
+                               <li key={i} className="flex gap-4">
+                                 <div className="bg-emerald-500 h-2 w-2 rounded-full mt-1.5 flex-shrink-0 shadow-lg shadow-emerald-200"></div>
+                                 <div>
+                                   <h4 className="font-black text-sm text-slate-700 uppercase leading-none mb-1">{item.t}</h4>
+                                   <p className="text-xs leading-relaxed">{item.d}</p>
+                                 </div>
+                               </li>
+                             ))}
+                          </ul>
+                        </section>
+
+                        <section className="bg-indigo-900 p-8 rounded-[2.5rem] text-white shadow-2xl relative overflow-hidden flex flex-col justify-center">
+                           <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-indigo-500/20 via-transparent to-transparent"></div>
+                           <h4 className="font-black uppercase tracking-widest text-indigo-300 text-xs mb-6 flex items-center gap-2 relative z-10">
+                             <Calculator size={14}/> Risk Analysis Math
+                           </h4>
+                           <div className="space-y-6 relative z-10">
+                              <div className="p-4 bg-white/5 rounded-2xl border border-white/10">
+                                <span className="block text-[10px] font-black text-indigo-400 uppercase mb-2 text-center">Corrected CAGR Formula</span>
+                                <div className="text-center font-mono text-xs text-indigo-100">
+                                  years = data_count / 365 <br/>
+                                  CAGR = (Ending_NAV / Start_NAV)^(1/years) - 1
+                                </div>
+                              </div>
+                              <p className="text-xs text-indigo-200 leading-relaxed italic text-center">
+                                *สูตรนี้ได้รับการแก้ไขให้เป็นไปตามมาตรฐานการวัดผลตอบแทนทบต้นรายปีที่ถูกต้อง
+                              </p>
+                           </div>
+                        </section>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* TAB: PNL CHART */}
+                  {activeTab === 'pnl_chart' && bestResult && (
+                    <div className="h-[500px] animate-in slide-in-from-right-4 duration-500">
+                      <div className="flex flex-col md:flex-row justify-between items-center mb-10 gap-4">
+                        <div className="flex items-center gap-4">
+                           <div className="bg-indigo-50 px-5 py-2.5 rounded-2xl border border-indigo-100 font-black text-xs text-indigo-600 uppercase">
+                             {bestResult.strategy} Mode
+                           </div>
+                           <div className="flex flex-col">
+                             <span className="text-[10px] font-black text-slate-400 uppercase">Sortino Ratio</span>
+                             <span className="text-sm font-black text-emerald-600 leading-none">{bestResult.sortino}</span>
+                           </div>
+                        </div>
+                        <div className="text-[9px] font-bold text-slate-400 uppercase tracking-[0.2em] border-l pl-4 border-slate-200">
+                          EMA: {bestResult.f}/{bestResult.s} | Univ: {bestResult.upct}% | Smooth: {bestResult.sm}
+                        </div>
+                      </div>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <ComposedChart data={bestResult.curve}>
+                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                          <XAxis dataKey="date" fontSize={9} axisLine={false} tickLine={false} minTickGap={60} stroke="#94a3b8" />
+                          <YAxis fontSize={9} axisLine={false} tickLine={false} stroke="#94a3b8" tickFormatter={(v)=>`${v}%`} />
+                          <Tooltip contentStyle={{ borderRadius: '24px', border: 'none', boxShadow: '0 20px 50px rgba(0,0,0,0.1)' }} />
+                          <Legend verticalAlign="top" height={36} wrapperStyle={{ fontSize: '10px', fontWeight: '900', textTransform: 'uppercase', marginBottom: '20px' }}/>
+                          <Area type="monotone" dataKey="pnl" name="Portfolio Return (%)" stroke="#4f46e5" strokeWidth={4} fill="url(#colorPnl)" />
+                          <Line type="monotone" dataKey="btc" name="BTC Benchmark (%)" stroke="#94a3b8" strokeWidth={1.5} dot={false} strokeDasharray="5 5" opacity={0.6} />
+                          <defs>
+                            <linearGradient id="colorPnl" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#4f46e5" stopOpacity={0.15}/>
+                              <stop offset="95%" stopColor="#4f46e5" stopOpacity={0}/>
+                            </linearGradient>
+                          </defs>
+                        </ComposedChart>
+                      </ResponsiveContainer>
+                    </div>
+                  )}
+
+                  {/* TAB: HOLDINGS LOGS */}
+                  {activeTab === 'logs' && bestResult && (
+                    <div className="overflow-x-auto rounded-[2rem] border border-slate-100 shadow-sm animate-in fade-in">
+                      <table className="w-full text-[10px] text-left">
+                        <thead className="bg-slate-900 text-slate-400 font-black uppercase tracking-widest border-b">
+                          <tr>
+                            <th className="p-5">Date</th>
+                            <th className="p-5 text-center">Exposure</th>
+                            <th className="p-5 text-center">Universe</th>
+                            <th className="p-5">Top Bullish Assets (By Volume)</th>
+                            <th className="p-5 text-right">Portfolio NAV ($)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-50">
+                          {bestResult.portLogs && bestResult.portLogs.length > 0 ? (
+                            bestResult.portLogs.slice().reverse().map((log, i) => (
+                              <tr key={i} className="hover:bg-slate-50 transition-colors">
+                                <td className="p-5 font-mono text-slate-500 font-bold">{log.date}</td>
+                                <td className="p-5 text-center">
+                                  <span className={`px-3 py-1 rounded-full text-[8px] font-black uppercase shadow-sm ${parseFloat(log.exp) > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
+                                    {log.exp}x
+                                  </span>
+                                </td>
+                                <td className="p-5 text-center font-black text-slate-400">{log.activeCount}</td>
+                                <td className="p-5">
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {log.holdings.map((h, idx) => (
+                                      <span key={idx} className="bg-white border border-slate-100 px-2 py-0.5 rounded-lg text-indigo-600 font-black text-[8px] shadow-sm">
+                                        {h.name}: {h.percent}%
+                                      </span>
+                                    ))}
+                                  </div>
+                                </td>
+                                <td className="p-5 text-right font-black text-slate-800 font-mono text-xs">${parseFloat(log.nav).toLocaleString()}</td>
+                              </tr>
+                            ))
+                          ) : (
+                            <tr><td colSpan="5" className="p-10 text-center text-slate-400 italic font-bold uppercase">Run Grid Search to view logs</td></tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </main>
+        </div>
+      </div>
+
+      <style dangerouslySetInnerHTML={{ __html: `
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+        body { font-family: 'Plus Jakarta Sans', sans-serif; letter-spacing: -0.01em; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+      ` }} />
+    </div>
+  );
+};
+
+const GridParamInput = ({ label, configKey, step, gridConfig, setGridConfig }) => (
+  <div className="space-y-3 p-4 bg-slate-50 rounded-3xl border border-slate-100 shadow-sm">
+    <label className="text-[10px] font-black text-indigo-500 uppercase tracking-widest flex items-center gap-2">
+      <Cpu size={12} /> {label}
+    </label>
+    <div className="grid grid-cols-3 gap-2">
+      <SmoothInput label="Start" value={gridConfig[configKey].start} onUpdate={(v)=>setGridConfig(c=>({...c, [configKey]:{...c[configKey], start:v}}))} step={step} />
+      <SmoothInput label="End" value={gridConfig[configKey].end} onUpdate={(v)=>setGridConfig(c=>({...c, [configKey]:{...c[configKey], end:v}}))} step={step} />
+      <SmoothInput label="Step" value={gridConfig[configKey].step} onUpdate={(v)=>setGridConfig(c=>({...c, [configKey]:{...c[configKey], step:v}}))} step={step} />
+    </div>
+  </div>
+);
+
+export default App;
